@@ -9,21 +9,24 @@ import random
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ===== DCInside 설정 =====
 
 BASE_URL = "https://gall.dcinside.com/mgallery/board/lists"
 GALLERY_ID = "starsavior"
-
-# 페이지 최대 탐색 수
 DEFAULT_MAX_PAGES = 15
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0 Safari/537.36"
-    )
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": f"https://gall.dcinside.com/mgallery/board/lists?id={GALLERY_ID}",
+    "Connection": "keep-alive",
 }
 
 # ===== Google Sheets 설정 =====
@@ -34,7 +37,7 @@ SHEET_NAME = "커뮤니티 파싱"
 RANGE_NAME = f"{SHEET_NAME}!A:B"
 
 # ===== 로그 설정 =====
-# Railway / 로컬 공통으로 현재 폴더 기준 저장
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ERROR_LOG_PATH = os.path.join(BASE_DIR, "error_log.txt")
 RUN_LOG_PATH = os.path.join(BASE_DIR, "run_log.txt")
@@ -56,9 +59,6 @@ def log_error(msg: str):
 
 
 def get_google_service():
-    """
-    Railway Variables의 GOOGLE_CREDENTIALS(JSON 문자열)로 인증 생성
-    """
     creds_raw = os.environ.get("GOOGLE_CREDENTIALS")
     if not creds_raw:
         raise RuntimeError("환경변수 GOOGLE_CREDENTIALS가 설정되지 않았습니다.")
@@ -68,30 +68,41 @@ def get_google_service():
     return build("sheets", "v4", credentials=creds)
 
 
-# ===== 날짜 파싱 =====
+def build_session() -> requests.Session:
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+
+    adapter = HTTPAdapter(max_retries=retry)
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
 
 def parse_dc_date(raw: str, today: date) -> date | None:
-    """
-    DCInside 날짜 문자열을 date 객체로 변환.
-    가능한 여러 포맷을 시도해서 최대한 유연하게 처리.
-    """
     raw = raw.strip()
 
-    # 1) "YYYY.MM.DD HH:MM:SS" / "YYYY-MM-DD HH:MM:SS"
     for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.strptime(raw, fmt).date()
         except ValueError:
             pass
 
-    # 2) "YYYY.MM.DD" / "YYYY-MM-DD"
     for fmt in ("%Y.%m.%d", "%Y-%m-%d"):
         try:
             return datetime.strptime(raw, fmt).date()
         except ValueError:
             pass
 
-    # 3) "MM.DD" / "MM-DD"
     for fmt in ("%m.%d", "%m-%d"):
         try:
             dt = datetime.strptime(raw, fmt)
@@ -99,7 +110,6 @@ def parse_dc_date(raw: str, today: date) -> date | None:
         except ValueError:
             pass
 
-    # 4) "HH:MM" → 오늘 날짜로 간주
     try:
         datetime.strptime(raw, "%H:%M")
         return today
@@ -109,47 +119,52 @@ def parse_dc_date(raw: str, today: date) -> date | None:
     return None
 
 
-# ===== DCInside 크롤링 =====
-
 def count_posts_on_date(
     target_date: date,
     max_pages: int = DEFAULT_MAX_PAGES,
     debug: bool = False
 ) -> int:
-    """
-    스타세이비어 마이너 갤에서 target_date에 작성된 게시글 개수를 센다.
-    """
     page = 1
     total_count = 0
     today = datetime.now().date()
+    session = build_session()
 
     while page <= max_pages:
         params = {"id": GALLERY_ID, "page": page}
-        resp = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=10)
 
-        if debug:
-            print(f"[DEBUG] 요청 URL = {resp.url}, status = {resp.status_code}")
+        try:
+            resp = session.get(BASE_URL, params=params, timeout=(10, 30))
 
-        resp.raise_for_status()
+            if debug:
+                print(f"[DEBUG] 요청 URL = {resp.url}, status = {resp.status_code}")
+
+            resp.raise_for_status()
+
+        except requests.exceptions.RequestException as e:
+            log_run(f"[WARN] page={page} 요청 실패: {e}")
+            if debug:
+                print(f"[DEBUG] page {page} 요청 실패: {e}")
+
+            time.sleep(random.uniform(2.0, 4.0))
+            page += 1
+            continue
+
         soup = BeautifulSoup(resp.text, "html.parser")
 
         rows = soup.select("tr.ub-content.us-post")
+        if not rows:
+            rows = [tr for tr in soup.select("tbody tr") if tr.select_one(".gall_date")]
 
         if not rows:
-            all_tr = soup.select("tbody tr")
-            cand = []
-            for tr in all_tr:
-                if tr.select_one(".gall_date"):
-                    cand.append(tr)
-            rows = cand
-
-        if not rows:
+            log_run(f"[INFO] page={page} 게시글 행 없음, 크롤링 종료")
             if debug:
                 print(f"[DEBUG] page {page}: 게시글 행을 찾지 못했습니다. 중단.")
             break
 
         if debug:
             print(f"[DEBUG] page {page}: rows={len(rows)}개")
+
+        page_matched = 0
 
         for idx, row in enumerate(rows):
             cls = row.get("class", [])
@@ -173,19 +188,17 @@ def count_posts_on_date(
 
             if post_date == target_date:
                 total_count += 1
+                page_matched += 1
 
-        time.sleep(random.uniform(0.6, 1.2))
+        log_run(f"page={page} 처리 완료 / target_date={target_date} / matched={page_matched}")
+        time.sleep(random.uniform(1.2, 2.3))
         page += 1
 
+    session.close()
     return total_count
 
 
-# ===== Google Sheets 기록 =====
-
 def append_to_google_sheet(target_date: date, count: int):
-    """
-    target_date와 count를 구글 시트에 1행 추가.
-    """
     service = get_google_service()
     sheet = service.spreadsheets()
 
@@ -200,8 +213,6 @@ def append_to_google_sheet(target_date: date, count: int):
         body=body,
     ).execute()
 
-
-# ===== 실행부 =====
 
 if __name__ == "__main__":
     now = datetime.now()
